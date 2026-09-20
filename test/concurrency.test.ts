@@ -81,6 +81,27 @@ async function setupReadyWithOneLock(pointCount = 2): Promise<{
   }
 }
 
+async function setupReadyWithoutLocks(pointCount = 2): Promise<{
+  ticketId: number
+  revision: number
+}> {
+  const s = await createTicketAsCoord(PORT_A, {
+    device: `ready-${Math.random()}`,
+    points: Array.from({ length: pointCount }, (_, i) => `点${i + 1}`),
+    personnel: ['zhang', 'li'],
+  })
+  const zhang = await clientFor(PORT_A, CREDS.zhang)
+  let rev = s.ticket.revision
+  for (const p of s.points) {
+    const r = await zhang.post<{ snapshot: Snapshot }>(
+      `/api/tickets/${s.ticket.id}/confirm`,
+      { pointId: p.id, revision: rev },
+    )
+    rev = r.snapshot.ticket.revision
+  }
+  return { ticketId: s.ticket.id, revision: rev }
+}
+
 async function assertLoserAgreesWithDb(
   loser: RaceResult,
   ticketId: number,
@@ -177,6 +198,96 @@ describe('撤最后一锁 × 复位 双实例交错', () => {
       expect(dbFinal.locks).toBe(0)
     })
   }
+
+  it('无锁可送电时，挂锁与复位基于同一 revision 并发也只能成功一方', async () => {
+    const { ticketId, revision } = await setupReadyWithoutLocks(1)
+
+    const zhangA = await clientFor(PORT_A, CREDS.zhang)
+    const leadB = await clientFor(PORT_B, CREDS.lead)
+
+    const [place, reset] = await Promise.all([
+      settled(
+        zhangA.post(`/api/tickets/${ticketId}/locks`, { revision }),
+        'place',
+      ),
+      settled(
+        leadB.post(`/api/tickets/${ticketId}/reset`, { revision }),
+        'reset',
+      ),
+    ])
+
+    const db = await dbSnapshot(ticketId)
+    expect([place.ok, reset.ok].filter(Boolean)).toHaveLength(1)
+
+    if (place.ok) {
+      expect(db.status).toBe('maintenance')
+      expect(db.locks).toBe(1)
+      expect(db.revision).toBe(revision + 1)
+      expect(reset.status).toBe(409)
+      expect(reset.snapshot!.ticket.revision).toBe(db.revision)
+      expect(reset.snapshot!.locks).toHaveLength(1)
+      expect(reset.blockers ?? reset.snapshot!.blockers).toContain('locks:1')
+    } else {
+      expect(db.status).toBe('energized')
+      expect(db.locks).toBe(0)
+      expect(db.revision).toBe(revision + 1)
+      expect(place.status).toBe(409)
+      expect(place.snapshot!.ticket.status).toBe('energized')
+      expect(place.snapshot!.blockers).toEqual(['terminal'])
+    }
+  })
+
+  it('撤锁必定推进 revision，旧 revision 的复位不能与其共享同一版本', async () => {
+    const { ticketId, revision } = await setupReadyWithOneLock(1)
+    const zhangA = await clientFor(PORT_A, CREDS.zhang)
+    const leadB = await clientFor(PORT_B, CREDS.lead)
+
+    const removed = await zhangA.del<{ snapshot: Snapshot }>(
+      `/api/tickets/${ticketId}/locks`,
+      { revision },
+    )
+    expect(removed.snapshot.locks).toHaveLength(0)
+    expect(removed.snapshot.ticket.revision).toBe(revision + 1)
+
+    const staleReset = await leadB
+      .post(`/api/tickets/${ticketId}/reset`, { revision })
+      .catch((e) => e as HttpError)
+    expect(staleReset.status).toBe(409)
+    expect(staleReset.body.error.latestRevision).toBe(revision + 1)
+    expect(staleReset.body.error.snapshot.ticket.revision).toBe(revision + 1)
+
+    const db = await dbSnapshot(ticketId)
+    expect(db.status).toBe('maintenance')
+    expect(db.revision).toBe(revision + 1)
+  })
+
+  it('复位成功后用最新 revision 串行再次复位仍被拒绝，revision 与更新时间不再改写', async () => {
+    const { ticketId, revision } = await setupReadyWithoutLocks(1)
+    const leadA = await clientFor(PORT_A, CREDS.lead)
+    const leadB = await clientFor(PORT_B, CREDS.lead)
+
+    const first = await leadA.post<{ snapshot: Snapshot }>(
+      `/api/tickets/${ticketId}/reset`,
+      { revision },
+    )
+    const energizedAt = first.snapshot.ticket.updated_at
+    expect(first.snapshot.ticket.status).toBe('energized')
+    expect(first.snapshot.ticket.revision).toBe(revision + 1)
+
+    const second = await leadB
+      .post(`/api/tickets/${ticketId}/reset`, { revision: revision + 1 })
+      .catch((e) => e as HttpError)
+    expect(second.status).toBe(409)
+    expect(second.body.error.code).toBe('CONFLICT')
+    expect(second.body.error.snapshot.ticket.status).toBe('energized')
+    expect(second.body.error.snapshot.ticket.revision).toBe(revision + 1)
+    expect(second.body.error.blockers).toEqual(['terminal'])
+    expect(second.body.error.snapshot.ticket.updated_at).toBe(energizedAt)
+
+    const db = await dbSnapshot(ticketId)
+    expect(db.status).toBe('energized')
+    expect(db.revision).toBe(revision + 1)
+  })
 
   it('复位成功后再次复位（即便带最新 revision）仍被拒绝，且只成功一次', async () => {
     const { ticketId, revision } = await setupReadyWithOneLock(1)

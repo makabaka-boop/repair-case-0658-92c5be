@@ -150,6 +150,81 @@ describe('界面：过期请求自动重载最新牌板', () => {
     expect(within(row2).getByText('zhang')).toBeTruthy()
   })
 
+  it('送电复位收到并发冲突后，牌板立即采用最新修订号、锁数和阻断项', async () => {
+    const coord = await clientFor(4171, CREDS.coord)
+    const created = await coord.post<{ snapshot: any }>('/api/tickets', {
+      device: '4 号电机',
+      points: ['断电'],
+      personnel: ['zhang'],
+    })
+    const ticketId = created.snapshot.ticket.id
+    const point = created.snapshot.points[0]
+
+    const zhang = await clientFor(4172, CREDS.zhang)
+    const confirmed = await zhang.post<{ snapshot: any }>(
+      `/api/tickets/${ticketId}/confirm`,
+      { pointId: point.id, revision: 1 },
+    )
+    const readyRevision = confirmed.snapshot.ticket.revision
+
+    renderApp()
+    fireEvent.change(screen.getByTestId('login-username'), {
+      target: { value: 'lead' },
+    })
+    fireEvent.change(screen.getByTestId('login-password'), {
+      target: { value: 'lead123' },
+    })
+    fireEvent.click(screen.getByTestId('login-submit'))
+    await waitFor(() =>
+      expect(screen.getByTestId(`ticket-card-${ticketId}`)).toBeTruthy(),
+    )
+    fireEvent.click(screen.getByTestId(`ticket-card-${ticketId}`))
+    await waitFor(() =>
+      expect(screen.getByText('全部必检点已确认且个人锁为零，满足送电条件。')).toBeTruthy(),
+    )
+    expect((screen.getByTestId('reset-btn') as HTMLButtonElement).disabled).toBe(
+      false,
+    )
+
+    // 负责人旧页面仍显示无锁时，检修人员在另一实例挂锁。
+    await zhang.post(`/api/tickets/${ticketId}/locks`, {
+      revision: readyRevision,
+    })
+
+    fireEvent.click(screen.getByTestId('reset-btn'))
+
+    // 不能只更新提示：牌板本身必须刷新到冲突响应中的最新快照。
+    await waitFor(() =>
+      expect(screen.getByTestId('revision').textContent).toContain(
+        `修订号 ${readyRevision + 1}`,
+      ),
+    )
+    expect(screen.getByTestId('board-notice').textContent).toContain('页面已过期')
+    expect(screen.getByTestId('lock-list').textContent).toContain('zhang')
+    expect(screen.getByTestId('reset-blockers').textContent).toContain(
+      '个人锁 1 把',
+    )
+    expect((screen.getByTestId('reset-btn') as HTMLButtonElement).disabled).toBe(
+      true,
+    )
+
+    // 撤锁后旧牌板仍不能绕过按钮；刷新到最新快照后才能送电。
+    await zhang.del(`/api/tickets/${ticketId}/locks`, {
+      revision: readyRevision + 1,
+    })
+    fireEvent.click(screen.getByTestId('reload-btn'))
+    await waitFor(() =>
+      expect(screen.queryByTestId('reset-blockers')).toBeNull(),
+    )
+    fireEvent.click(screen.getByTestId('reset-btn'))
+    await waitFor(() =>
+      expect(screen.getByTestId('revision').textContent).toContain(
+        `修订号 ${readyRevision + 3}`,
+      ),
+    )
+    expect(screen.getByTestId('terminal-banner')).toBeTruthy()
+  })
+
   it('送电负责人页面看到的阻断项随并发撤锁更新，刷新后可复位，终态拒绝挂锁', async () => {
     const coord = await clientFor(4171, CREDS.coord)
     const created = await coord.post<{ snapshot: any }>('/api/tickets', {

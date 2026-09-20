@@ -10,8 +10,8 @@ export interface BoardNotice {
 /**
  * 牌板状态钩子。
  * - 任何写操作都携带当前页面所见 revision（snapshot.ticket.revision）。
- * - 409 CONFLICT：页面过期/并发失败，保留当前牌板并展示服务端返回的
- *   最新修订号与阻断项，用户可以自行决定何时重新加载。
+ * - 409 CONFLICT：页面过期/并发失败，失败操作不入库；立即用服务端返回的
+ *   最新快照刷新牌板，避免后续请求继续携带过期修订号。
  * - 403 FORBIDDEN：提示越权，不改变牌板。
  */
 export function useBoard(ticketId: number, onChanged?: (s: Snapshot) => void) {
@@ -50,7 +50,7 @@ export function useBoard(ticketId: number, onChanged?: (s: Snapshot) => void) {
     reload()
   }, [reload])
 
-  /** 执行一个必须携带 revision 的变更；并发/越权/终态失败均不破坏当前牌板 */
+  /** 执行一个必须携带 revision 的变更；失败操作不入库，CONFLICT 时用最新快照刷新牌板 */
   const mutate = useCallback(
     async (fn: (revision: number) => Promise<{ snapshot: Snapshot }>) => {
       if (seenRevision.current == null) return
@@ -64,13 +64,15 @@ export function useBoard(ticketId: number, onChanged?: (s: Snapshot) => void) {
       } catch (err) {
         if (err instanceof ApiError && err.snapshot) {
           if (err.code === 'CONFLICT') {
-            const blockers = err.blockers ?? err.snapshot.blockers
+            const latestSnapshot = err.snapshot
+            const blockers = err.blockers ?? latestSnapshot.blockers
+            applySnapshot(latestSnapshot)
             setNotice({
               kind: 'conflict',
               text:
                 blockers.length > 0 && blockers.join('') !== ''
-                  ? `页面已过期（最新阻断项：${describeBlockers(blockers)}，最新修订号 ${err.snapshot.ticket.revision}）`
-                  : `页面已过期（最新修订号 ${err.snapshot.ticket.revision}）`,
+                  ? `页面已过期（最新阻断项：${describeBlockers(blockers)}，最新修订号 ${latestSnapshot.ticket.revision}）`
+                  : `页面已过期（最新修订号 ${latestSnapshot.ticket.revision}）`,
             })
           } else {
             applySnapshot(err.snapshot)

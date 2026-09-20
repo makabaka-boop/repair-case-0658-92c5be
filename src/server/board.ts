@@ -434,6 +434,7 @@ export async function removeLock(
     if (rowCount === 0) {
       throw new BoardError('CONFLICT', '你在该票上没有个人锁可撤', { snapshot })
     }
+    await bumpRevision(client, ticketId)
     return readSnapshotAndRelockGuard(client, ticketId)
   })
 }
@@ -452,29 +453,19 @@ export async function resetTicket(
     throw new BoardError('FORBIDDEN', '仅送电负责人可执行复位送电')
   }
   return withTransaction(db, async (client) => {
-    // 先生成候选快照，缩短后续状态更新持有票行锁的时间
-    const row = await readTicket(client, ticketId)
-    if (!row) throw new BoardError('NOT_FOUND', '作业票不存在')
-    const snapshot = await readSnapshot(client, row)
+    const { row, snapshot } = await lockTicketForWrite(
+      client,
+      actor,
+      ticketId,
+      expectedRevision,
+    )
 
-    if (
-      typeof expectedRevision !== 'number' ||
-      !Number.isInteger(expectedRevision)
-    ) {
-      throw new BoardError('VALIDATION', '必须携带页面所见修订号 revision', {
+    if (row.status === 'energized') {
+      throw new BoardError('CONFLICT', '作业票已复位送电，终态不可再次复位', {
         snapshot,
+        latestRevision: Number(row.revision),
+        blockers: ['terminal'],
       })
-    }
-    if (Number(row.revision) !== expectedRevision) {
-      throw new BoardError(
-        'CONFLICT',
-        `页面已过期：页面修订号 ${expectedRevision}，当前修订号 ${row.revision}`,
-        {
-          snapshot,
-          latestRevision: Number(row.revision),
-          blockers: snapshot.blockers,
-        },
-      )
     }
 
     const unconfirmed = snapshot.points.filter((p) => p.confirmed_by == null)
@@ -490,16 +481,27 @@ export async function resetTicket(
       throw new BoardError(
         'CONFLICT',
         `当前不满足送电条件（未确认点 ${unconfirmed.length} 个、个人锁 ${snapshot.locks.length} 把）`,
-        { snapshot, blockers },
+        {
+          snapshot,
+          latestRevision: Number(row.revision),
+          blockers,
+        },
       )
     }
 
-    await client.query(
+    const { rowCount } = await client.query(
       `UPDATE tickets
          SET status = 'energized', revision = revision + 1, updated_at = now()
-       WHERE id = $1`,
-      [ticketId],
+       WHERE id = $1 AND status = 'maintenance' AND revision = $2`,
+      [ticketId, expectedRevision],
     )
+    if (rowCount !== 1) {
+      throw new BoardError('CONFLICT', '作业票已被其他请求更新，请刷新后重试', {
+        snapshot,
+        latestRevision: Number(row.revision),
+        blockers: snapshot.blockers,
+      })
+    }
 
     return readSnapshotAndRelockGuard(client, ticketId)
   })
