@@ -10,8 +10,10 @@ export interface BoardNotice {
 /**
  * 牌板状态钩子。
  * - 任何写操作都携带当前页面所见 revision（snapshot.ticket.revision）。
- * - 409 CONFLICT：页面过期/并发失败，保留当前牌板并展示服务端返回的
- *   最新修订号与阻断项，用户可以自行决定何时重新加载。
+ * - 409 CONFLICT：页面过期/并发失败，立即用错误体里的【最新快照】刷新牌板
+ *   （修订号、锁数、确认状态、阻断项一并更新），并保留过期提示。这样后续
+ *   操作提交的是最新修订号，不会拿着过期视图反复冲突或误判“可送电”；
+ *   本次失败的变更本身不落库（未代签、未误复位）。
  * - 403 FORBIDDEN：提示越权，不改变牌板。
  */
 export function useBoard(ticketId: number, onChanged?: (s: Snapshot) => void) {
@@ -63,17 +65,20 @@ export function useBoard(ticketId: number, onChanged?: (s: Snapshot) => void) {
         setNotice({ kind: 'success', text: '操作已提交' })
       } catch (err) {
         if (err instanceof ApiError && err.snapshot) {
+          // CONFLICT 与 FORBIDDEN 都要用服务端快照刷新牌板：
+          // 冲突意味着本地视图已被并发者改写，必须整体替换为最新快照，
+          // 而不能只改提示文字、让牌板继续显示旧修订号/旧锁数/旧阻断项。
+          applySnapshot(err.snapshot)
           if (err.code === 'CONFLICT') {
             const blockers = err.blockers ?? err.snapshot.blockers
             setNotice({
               kind: 'conflict',
               text:
                 blockers.length > 0 && blockers.join('') !== ''
-                  ? `页面已过期（最新阻断项：${describeBlockers(blockers)}，最新修订号 ${err.snapshot.ticket.revision}）`
-                  : `页面已过期（最新修订号 ${err.snapshot.ticket.revision}）`,
+                  ? `页面已过期，已自动刷新到最新牌板（最新阻断项：${describeBlockers(blockers)}，最新修订号 ${err.snapshot.ticket.revision}）`
+                  : `页面已过期，已自动刷新到最新牌板（最新修订号 ${err.snapshot.ticket.revision}）`,
             })
           } else {
-            applySnapshot(err.snapshot)
             setNotice({ kind: 'forbidden', text: err.message })
           }
         } else if (err instanceof ApiError) {

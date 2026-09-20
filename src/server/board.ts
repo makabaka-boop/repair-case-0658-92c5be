@@ -8,9 +8,12 @@
 //  2. 每个写请求必须携带页面所见 revision；与库中不符即 409 CONFLICT，
 //     事务回滚，牌板保持当前状态，并返回最新快照。
 //  3. 复位（reset）的“全部点已确认 + 锁数为零 + 仍在检修”判定与状态
-//     翻转、revision 自增在同一事务原子提交，杜绝失锁更新（lost update）。
-//  4. 票进入 energized 后，确认/挂锁/撤锁一律 409 terminal，保证
-//     “成功后拒绝任何确认或挂锁”。
+//     翻转、revision 自增在同一事务（同一把票行 FOR UPDATE 锁）内原子
+//     提交，杜绝失锁更新（lost update）：挂锁与复位即使基于同一 revision
+//     并发，也被行锁强制串行，败方在锁释放后读到最新 revision/锁数并 409。
+//  4. 票进入 energized 后，确认/挂锁/撤锁/再次复位一律 409 terminal，
+//     且终态检查在同一把行锁内完成、revision/updated_at 不再被改写，
+//     保证“复位最多成功一次”，重试只拿到终态快照。
 import type { Pool, PoolClient } from 'pg'
 import type {
   IsolationPoint,
@@ -434,13 +437,18 @@ export async function removeLock(
     if (rowCount === 0) {
       throw new BoardError('CONFLICT', '你在该票上没有个人锁可撤', { snapshot })
     }
+    // 撤锁是一次状态变更（锁数变化会改变送电阻断项），必须推进修订号，
+    // 否则基于撤锁前旧 revision 的复位请求仍会被误判为“页面未过期”。
+    await bumpRevision(client, ticketId)
     return readSnapshotAndRelockGuard(client, ticketId)
   })
 }
 
 /**
  * 送电负责人复位（送电）：
- * 仅当 全部点已确认 + 锁数为 0 + 票仍在检修。判定与翻转原子提交。
+ * 仅当 全部点已确认 + 锁数为 0 + 票仍在检修。判定与翻转在同一把票行
+ * FOR UPDATE 锁内原子提交：先取排他锁与锁内最新快照，再比修订号、查终态、
+ * 查阻断项，最后以 WHERE status='maintenance' 条件 UPDATE 兜底翻转。
  */
 export async function resetTicket(
   db: Pool,
@@ -452,28 +460,20 @@ export async function resetTicket(
     throw new BoardError('FORBIDDEN', '仅送电负责人可执行复位送电')
   }
   return withTransaction(db, async (client) => {
-    // 先生成候选快照，缩短后续状态更新持有票行锁的时间
-    const row = await readTicket(client, ticketId)
-    if (!row) throw new BoardError('NOT_FOUND', '作业票不存在')
-    const snapshot = await readSnapshot(client, row)
+    const { row, snapshot } = await lockTicketForWrite(
+      client,
+      actor,
+      ticketId,
+      expectedRevision,
+    )
 
-    if (
-      typeof expectedRevision !== 'number' ||
-      !Number.isInteger(expectedRevision)
-    ) {
-      throw new BoardError('VALIDATION', '必须携带页面所见修订号 revision', {
-        snapshot,
-      })
-    }
-    if (Number(row.revision) !== expectedRevision) {
+    // 终态不可逆：票已送电后，即便携带最新修订号也必须拒绝，
+    // 且不得改写 revision / updated_at（阻断项固定为 terminal）。
+    if (row.status !== 'maintenance') {
       throw new BoardError(
         'CONFLICT',
-        `页面已过期：页面修订号 ${expectedRevision}，当前修订号 ${row.revision}`,
-        {
-          snapshot,
-          latestRevision: Number(row.revision),
-          blockers: snapshot.blockers,
-        },
+        '作业票已复位送电，终态不可再次复位',
+        { snapshot, latestRevision: Number(row.revision), blockers: ['terminal'] },
       )
     }
 
@@ -494,12 +494,26 @@ export async function resetTicket(
       )
     }
 
-    await client.query(
+    // 条件翻转作为最后一道防线：仅检修态可翻转；同一行锁内串行的并发
+    // 复位只有第一条 UPDATE 能命中 maintenance 行，后续命中 0 行。
+    const { rowCount } = await client.query(
       `UPDATE tickets
          SET status = 'energized', revision = revision + 1, updated_at = now()
-       WHERE id = $1`,
+       WHERE id = $1 AND status = 'maintenance'`,
       [ticketId],
     )
+    if (rowCount === 0) {
+      const latest = await readTicket(client, ticketId)
+      if (latest) {
+        const latestSnapshot = await readSnapshot(client, latest)
+        throw new BoardError('CONFLICT', '作业票已复位送电，终态不可再次复位', {
+          snapshot: latestSnapshot,
+          latestRevision: Number(latest.revision),
+          blockers: ['terminal'],
+        })
+      }
+      throw new BoardError('INTERNAL', '作业票在写入后消失')
+    }
 
     return readSnapshotAndRelockGuard(client, ticketId)
   })
